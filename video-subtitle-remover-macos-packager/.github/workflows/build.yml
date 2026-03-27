@@ -1,0 +1,118 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream tag, branch, or commit
+        required: false
+        default: main
+      create_release:
+        description: Create or update a GitHub Release
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-build.txt
+            requirements-macos.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements-build.txt
+          python -m pip install -r requirements-macos.txt
+
+      - name: Import Apple signing certificate
+        if: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/build.keychain-db"
+          CERT_PATH="${RUNNER_TEMP}/signing-cert.p12"
+          KEYCHAIN_PASSWORD="${RUNNER_TEMP}"
+
+          echo "${APPLE_CERTIFICATE_P12_BASE64}" | base64 -D > "${CERT_PATH}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+          security default-keychain -s "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+      - name: Build macOS app and dmg
+        run: python scripts/build_macos.py --ref "${{ inputs.upstream_ref }}"
+
+      - name: Collect artifact paths
+        id: artifact_paths
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          release = Path("release")
+          app_path = next(release.glob("*.app"))
+          dmg_path = next(release.glob("*.dmg"))
+
+          version = None
+          for line in (release / "build-info.txt").read_text(encoding="utf-8").splitlines():
+              if line.startswith("version="):
+                  version = line.split("=", 1)[1]
+                  break
+
+          if version is None:
+              raise SystemExit("version not found in build-info.txt")
+
+          github_output = Path(os.environ["GITHUB_OUTPUT"])
+          with github_output.open("a", encoding="utf-8") as handle:
+              handle.write(f"app_path={app_path}\n")
+              handle.write(f"dmg_path={dmg_path}\n")
+              handle.write(f"version={version}\n")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-subtitle-remover-macos-${{ steps.artifact_paths.outputs.version }}
+          path: |
+            ${{ steps.artifact_paths.outputs.app_path }}
+            ${{ steps.artifact_paths.outputs.dmg_path }}
+            release/build-info.txt
+
+      - name: Publish Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vsr-macos-${{ steps.artifact_paths.outputs.version }}
+          name: Video Subtitle Remover macOS ${{ steps.artifact_paths.outputs.version }}
+          prerelease: true
+          files: |
+            ${{ steps.artifact_paths.outputs.dmg_path }}
+            release/build-info.txt
